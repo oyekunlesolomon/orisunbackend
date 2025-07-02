@@ -156,7 +156,7 @@ app.post('/api/register', async (req, res) => {
     }
 
     const token = jwt.sign({ id: user._id.toString() }, JWT_SECRET, { expiresIn: '1h' });
-    const inviteLink = `${process.env.FRONTEND_URL || 'https://orisun-frontend.vercel.app'}/register?invite=${token}`;
+    const inviteLink = `https://orisun-frontend.vercel.app/register?invite=${token}`;
     await sendInvitationEmail(email, inviterName, relationship, inviteLink);
     sendResponse(res, 201, 'Registration successful!', {
       token,
@@ -247,7 +247,7 @@ app.post('/api/add-relative', authenticate, async (req, res) => {
       // Always populate person for inviter to get full name
       const inviterWithPerson = await User.findById(user._id).populate('person');
       const inviterName = inviterWithPerson.person ? `${inviterWithPerson.person.firstName} ${inviterWithPerson.person.surname}` : inviterWithPerson.email;
-      const inviteLink = `${process.env.FRONTEND_URL || 'https://orisun-frontend.vercel.app'}/register?invite=${token}`;
+      const inviteLink = `https://orisun-frontend.vercel.app/register?invite=${token}`;
       await sendInvitationEmail(email, inviterName, relationship, inviteLink);
     }
 
