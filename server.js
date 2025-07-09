@@ -342,7 +342,7 @@ app.post('/api/register', async (req, res) => {
     }
 
     const token = jwt.sign({ id: user._id.toString() }, JWT_SECRET, { expiresIn: '1h' });
-    const inviteLink = `https://orisun-frontend.vercel.app/register?invite=${token}`;
+    const inviteLink = `http://localhost:3000/register?invite=${token}`;
     await sendInvitationEmail(email, `${firstName} ${surname}`, relationship, inviteLink);
     sendResponse(res, 201, 'Registration successful!', {
       token,
@@ -414,199 +414,126 @@ app.post('/api/add-relative', authenticate, async (req, res) => {
     }
 
     const user = await User.findById(req.user.id).populate('person');
-    if (!user) {
-      return sendResponse(res, 404, 'User not found.');
-    }
+    if (!user) return sendResponse(res, 404, 'User not found.');
     const userPerson = await Person.findById(user.person);
-    if (!userPerson) {
-      return sendResponse(res, 404, 'User person not found.');
-    }
+    if (!userPerson) return sendResponse(res, 404, 'User person not found.');
 
     // 1. Find or create/update the Person for the relative
     let relativePerson = null;
+    const validGenders = ['male', 'female', 'other'];
+    let personData = { firstName: name, surname, maidenName, email, dob };
+    if (validGenders.includes(gender)) personData.gender = gender;
     if (email) {
       relativePerson = await Person.findOne({ email });
       if (relativePerson) {
-        // Update info if changed
         let changed = false;
         if (relativePerson.firstName !== name) { relativePerson.firstName = name; changed = true; }
         if (relativePerson.surname !== surname) { relativePerson.surname = surname; changed = true; }
         if (relativePerson.maidenName !== maidenName) { relativePerson.maidenName = maidenName; changed = true; }
-        if (relativePerson.gender !== gender) { relativePerson.gender = gender; changed = true; }
+        if (validGenders.includes(gender) && relativePerson.gender !== gender) { relativePerson.gender = gender; changed = true; }
         if (dob && (!relativePerson.dob || String(relativePerson.dob) !== String(new Date(dob)))) { relativePerson.dob = dob; changed = true; }
         if (changed) await relativePerson.save();
       }
     }
     if (!relativePerson) {
-      relativePerson = new Person({
-        firstName: name,
-        surname,
-        maidenName,
-        email,
-        gender,
-        dob,
-      });
+      relativePerson = new Person(personData);
       await relativePerson.save();
     }
 
-    // 2. Add the relationship to the user's Person document
-    let updated = false;
-    const hasRel = (arr, id) => arr.some(x => x.equals(id));
-    switch (relationship) {
+    // 2. Update both Person documents for the relationship
+    const addUnique = (arr, id) => arr.some(x => x.equals(id)) ? arr : [...arr, id];
+    const relType = relationship.toLowerCase();
+    // User -> Relative
+    switch (relType) {
       case 'father':
       case 'mother':
       case 'parent':
-        if (!hasRel(userPerson.parents, relativePerson._id)) {
-          userPerson.parents.push(relativePerson._id);
-          updated = true;
-        }
+        userPerson.parents = addUnique(userPerson.parents, relativePerson._id);
         break;
       case 'child':
-        if (!hasRel(userPerson.children, relativePerson._id)) {
-          userPerson.children.push(relativePerson._id);
-          updated = true;
-        }
+        userPerson.children = addUnique(userPerson.children, relativePerson._id);
         break;
       case 'spouse':
-        if (!hasRel(userPerson.spouses, relativePerson._id)) {
-          userPerson.spouses.push(relativePerson._id);
-          updated = true;
-        }
+        userPerson.spouses = addUnique(userPerson.spouses, relativePerson._id);
         break;
       case 'sibling':
-        if (!hasRel(userPerson.siblings, relativePerson._id)) {
-          userPerson.siblings.push(relativePerson._id);
-          updated = true;
-        }
+        userPerson.siblings = addUnique(userPerson.siblings, relativePerson._id);
         break;
-      // Add more cases as needed
+      // Add more as needed
     }
-    if (updated) await userPerson.save();
-
-    // 3. Add the inverse relationship to the relative's Person document
-    let inverseUpdated = false;
-    switch (relationship) {
+    await userPerson.save();
+    // Relative -> User (inverse)
+    switch (relType) {
       case 'father':
       case 'mother':
       case 'parent':
-        if (!hasRel(relativePerson.children, userPerson._id)) {
-          relativePerson.children.push(userPerson._id);
-          inverseUpdated = true;
-        }
+        relativePerson.children = addUnique(relativePerson.children, userPerson._id);
         break;
-      case 'child': {
-        // Set parent type based on user's gender
-        let parentType = 'parent';
-        if (userPerson.gender === 'male') parentType = 'father';
-        else if (userPerson.gender === 'female') parentType = 'mother';
-        if (!hasRel(relativePerson.parents, userPerson._id)) {
-          relativePerson.parents.push(userPerson._id);
-          inverseUpdated = true;
-        }
+      case 'child':
+        relativePerson.parents = addUnique(relativePerson.parents, userPerson._id);
         break;
-      }
       case 'spouse':
-        if (!hasRel(relativePerson.spouses, userPerson._id)) {
-          relativePerson.spouses.push(userPerson._id);
-          inverseUpdated = true;
-        }
+        relativePerson.spouses = addUnique(relativePerson.spouses, userPerson._id);
         break;
       case 'sibling':
-        if (!hasRel(relativePerson.siblings, userPerson._id)) {
-          relativePerson.siblings.push(userPerson._id);
-          inverseUpdated = true;
-        }
+        relativePerson.siblings = addUnique(relativePerson.siblings, userPerson._id);
         break;
-      // Add more cases as needed
+      // Add more as needed
     }
-    if (inverseUpdated) await relativePerson.save();
+    await relativePerson.save();
+
+    // 3. Update User.relatives for both users (if both are users)
+    const relativeUser = email ? await User.findOne({ email }) : null;
+    // Helper to get relationship label for user -> relative
+    const getRelLabel = () => {
+      if (relType === 'child') {
+        if (userPerson.gender === 'male') return 'father';
+        if (userPerson.gender === 'female') return 'mother';
+        return 'parent';
+      }
+      return relType;
+    };
+    // Helper to get inverse label for relative -> user
+    const getInverseLabel = () => {
+      if (relType === 'father' || relType === 'mother' || relType === 'parent') return 'child';
+      if (relType === 'child') {
+        if (relativePerson.gender === 'male') return 'son';
+        if (relativePerson.gender === 'female') return 'daughter';
+        return 'child';
+      }
+      return relType;
+    };
+    // Add to user's relatives
+    const alreadyInUser = (user.relatives || []).some(r => r.email === email && r.relationship === relType);
+    if (!alreadyInUser) {
+      user.relatives.push({ name, surname, maidenName, email, relationship: relType, gender, dob, parentName });
+      await user.save();
+    }
+    // Add to relative's relatives if they are a user
+    if (relativeUser) {
+      const alreadyInRel = (relativeUser.relatives || []).some(r => r.email === user.email && r.relationship === getRelLabel());
+      if (!alreadyInRel) {
+        relativeUser.relatives.push({
+          name: user.firstName,
+          surname: user.surname,
+          email: user.email,
+          relationship: getRelLabel(),
+          gender: user.gender,
+        });
+        await relativeUser.save();
+      }
+    }
 
     // 4. Send invitation email if the relative is not already a user and email is provided
-    if (email) {
-      const existingUser = await User.findOne({ email });
-      if (!existingUser) {
-        // Create invitation
-        const token = crypto.randomBytes(24).toString('hex');
-        const invitation = new Invitation({
-          inviter: user._id,
-          inviteeEmail: email,
-          relationship,
-          token,
-          status: 'pending',
-        });
-        await invitation.save();
-        const inviteLink = `${process.env.FRONTEND_URL || 'https://orisun-frontend.vercel.app'}/register?invite=${token}`;
-        await sendInvitationEmail(email, `${user.firstName} ${user.surname}`, relationship, inviteLink);
-      }
+    if (email && !relativeUser) {
+      const token = crypto.randomBytes(24).toString('hex');
+      const invitation = new Invitation({ inviter: user._id, inviteeEmail: email, relationship, token, status: 'pending' });
+      await invitation.save();
+      const inviteLink = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/register?invite=${token}`;
+      await sendInvitationEmail(email, `${user.firstName} ${user.surname}`, relationship, inviteLink);
     }
 
-    // 5. Keep user.relatives for backward compatibility
-    const relative = { name, surname, maidenName, email, relationship, gender, dob, parentName };
-    user.relatives.push(relative);
-    await user.save();
-
-    // 6. If adding a child, also add the child to the spouse's Person and User.relatives if spouse exists
-    if (relationship === 'child') {
-      if (userPerson.spouses && userPerson.spouses.length > 0) {
-        for (const spouseId of userPerson.spouses) {
-          const spousePerson = await Person.findById(spouseId);
-          if (spousePerson && !spousePerson.children.some(x => x.equals(relativePerson._id))) {
-            spousePerson.children.push(relativePerson._id);
-            await spousePerson.save();
-          }
-          // Also add to spouse's User.relatives if spouse is a registered user
-          const spouseUser = await User.findOne({ person: spouseId });
-          if (spouseUser) {
-            const already = (spouseUser.relatives || []).some(r => r.email === email && r.relationship === 'child');
-            if (!already) {
-              spouseUser.relatives.push({
-                name,
-                surname,
-                maidenName,
-                email,
-                relationship: 'child',
-                gender,
-                dob,
-                parentName: `${user.firstName} ${user.surname}`
-              });
-              await spouseUser.save();
-            } else {
-              // Update parentName if needed
-              const idx = spouseUser.relatives.findIndex(r => r.email === email && r.relationship === 'child');
-              if (idx !== -1 && spouseUser.relatives[idx].parentName !== `${user.firstName} ${user.surname}`) {
-                spouseUser.relatives[idx].parentName = `${user.firstName} ${user.surname}`;
-                await spouseUser.save();
-              }
-            }
-          }
-        }
-      }
-      // Also ensure the current user has the child in relatives with parentName set to spouse's name (if spouse exists)
-      if (userPerson.spouses && userPerson.spouses.length > 0) {
-        for (const spouseId of userPerson.spouses) {
-          const spousePerson = await Person.findById(spouseId);
-          if (spousePerson) {
-            const spouseFullName = `${spousePerson.firstName} ${spousePerson.surname}`;
-            const already = (user.relatives || []).some(r => r.email === email && r.relationship === 'child' && r.parentName === spouseFullName);
-            if (!already) {
-              user.relatives.push({
-                name,
-                surname,
-                maidenName,
-                email,
-                relationship: 'child',
-                gender,
-                dob,
-                parentName: spouseFullName
-              });
-              await user.save();
-            }
-          }
-        }
-      }
-    }
-
-    sendResponse(res, 201, 'Relative added and synced successfully!', { relative });
+    sendResponse(res, 201, 'Relative added and synced successfully!', { relative: { name, surname, maidenName, email, relationship, gender, dob, parentName } });
   } catch (error) {
     console.error('Error adding relative:', error);
     sendResponse(res, 500, 'Internal server error', { error: error.message });

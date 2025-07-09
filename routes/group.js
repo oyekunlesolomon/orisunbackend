@@ -70,7 +70,7 @@ router.post('/', authenticate, async (req, res) => {
       status: 'pending',
     });
     await invitation.save();
-    const inviteLink = `${process.env.FRONTEND_URL || 'https://orisun-frontend.vercel.app'}/group-invite?token=${token}`;
+    const inviteLink = `http://localhost:3000/group-invite?token=${token}`;
     await sendGroupInviteEmail(inviteeUser.email, `${inviterUser.firstName} ${inviterUser.surname}`, name, inviteLink);
   }
   res.status(201).json(group);
