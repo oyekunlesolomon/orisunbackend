@@ -13,6 +13,16 @@ const personSchema = new mongoose.Schema({
   children: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Person' }],
   siblings: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Person' }],
   online: { type: Boolean, default: false },
+  // Pending relationships for unregistered users
+  pendingRelationships: [{
+    type: {
+      type: String,
+      enum: ['spouse', 'child', 'parent', 'sibling'],
+      required: true
+    },
+    email: String, // email of the unregistered user
+    tempId: String // optional temp identifier
+  }],
 }, { timestamps: true });
 
 const Person = mongoose.model('Person', personSchema, 'people');

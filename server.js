@@ -12,6 +12,8 @@ const fs = require('fs');
 const http = require('http');
 const { Server } = require('socket.io');
 const groupRoutes = require('./routes/group');
+const scrabbleRoutes = require('./routes/scrabble');
+const scrabbleGames = require('./routes/scrabble').games; // Expose games object
 const User = require('./models/User');
 const Person = require('./models/Person');
 const Invitation = require('./models/Invitation');
@@ -19,6 +21,16 @@ const nodemailer = require('nodemailer');
 const crypto = require('crypto');
 const Familypedia = require('./models/Familypedia');
 const PersonalStory = require('./models/PersonalStory');
+const wordListPath = path.join(__dirname, '../node_modules/word-list/words.txt');
+const _ = require('lodash');
+let WORD_SET = null;
+function loadWordSet() {
+  if (!WORD_SET) {
+    const words = fs.readFileSync(wordListPath, 'utf8').split('\n');
+    WORD_SET = new Set(words.map(w => w.toUpperCase()));
+  }
+}
+loadWordSet();
 
 const app = express();
 
@@ -341,6 +353,88 @@ app.post('/api/register', async (req, res) => {
       }
     }
 
+    // After creating/saving the person and user, resolve pending relationships
+    // Find all Person docs with pendingRelationships for this email
+    const pendingFromOthers = await Person.find({ 'pendingRelationships.email': email });
+    for (const other of pendingFromOthers) {
+      // For each pending relationship
+      const pendings = (other.pendingRelationships || []).filter(pr => pr.email === email);
+      for (const pending of pendings) {
+        switch (pending.type) {
+          case 'spouse':
+            // Add each other as spouses
+            if (!other.spouses.some(x => x.equals(person._id))) {
+              other.spouses.push(person._id);
+            }
+            if (!person.spouses.some(x => x.equals(other._id))) {
+              person.spouses.push(other._id);
+            }
+            break;
+          case 'child':
+            // Add as child to other, and other as parent to person
+            if (!other.children.some(x => x.equals(person._id))) {
+              other.children.push(person._id);
+            }
+            if (!person.parents.some(x => x.equals(other._id))) {
+              person.parents.push(other._id);
+            }
+            // If other has a spouse, add as parent to person and add person as child to spouse
+            if (other.spouses && other.spouses.length > 0) {
+              for (const spouseId of other.spouses) {
+                const spouse = await Person.findById(spouseId);
+                if (spouse) {
+                  if (!person.parents.some(x => x.equals(spouse._id))) {
+                    person.parents.push(spouse._id);
+                  }
+                  if (!spouse.children.some(x => x.equals(person._id))) {
+                    spouse.children.push(person._id);
+                    await spouse.save();
+                  }
+                }
+              }
+            }
+            break;
+          case 'parent':
+            // Add as parent to other, and other as child to person
+            if (!person.children.some(x => x.equals(other._id))) {
+              person.children.push(other._id);
+            }
+            if (!other.parents.some(x => x.equals(person._id))) {
+              other.parents.push(person._id);
+            }
+            // If other has a spouse, add as child to person and add person as parent to spouse
+            if (other.spouses && other.spouses.length > 0) {
+              for (const spouseId of other.spouses) {
+                const spouse = await Person.findById(spouseId);
+                if (spouse) {
+                  if (!person.children.some(x => x.equals(spouse._id))) {
+                    person.children.push(spouse._id);
+                  }
+                  if (!spouse.parents.some(x => x.equals(person._id))) {
+                    spouse.parents.push(person._id);
+                    await spouse.save();
+                  }
+                }
+              }
+            }
+            break;
+          case 'sibling':
+            // Add each other as siblings
+            if (!other.siblings.some(x => x.equals(person._id))) {
+              other.siblings.push(person._id);
+            }
+            if (!person.siblings.some(x => x.equals(other._id))) {
+              person.siblings.push(other._id);
+            }
+            break;
+        }
+      }
+      // Remove resolved pending relationships
+      other.pendingRelationships = (other.pendingRelationships || []).filter(pr => pr.email !== email);
+      await other.save();
+    }
+    await person.save();
+
     const token = jwt.sign({ id: user._id.toString() }, JWT_SECRET, { expiresIn: '1h' });
     const inviteLink = `http://localhost:3000/register?invite=${token}`;
     await sendInvitationEmail(email, `${firstName} ${surname}`, relationship, inviteLink);
@@ -435,6 +529,15 @@ app.post('/api/add-relative', authenticate, async (req, res) => {
         if (changed) await relativePerson.save();
       }
     }
+    if (!relativePerson && email) {
+      // Add pending relationship to userPerson
+      userPerson.pendingRelationships = userPerson.pendingRelationships || [];
+      userPerson.pendingRelationships.push({
+        type: relationship.toLowerCase(),
+        email: email
+      });
+      await userPerson.save();
+    }
     if (!relativePerson) {
       relativePerson = new Person(personData);
       await relativePerson.save();
@@ -450,9 +553,60 @@ app.post('/api/add-relative', authenticate, async (req, res) => {
       case 'parent':
         userPerson.parents = addUnique(userPerson.parents, relativePerson._id);
         break;
-      case 'child':
+      case 'child': {
+        // Add child to user
         userPerson.children = addUnique(userPerson.children, relativePerson._id);
+        // If parentName is specified, find the spouse by name and add child to their children array, and add both parents to child's parents array
+        let spouse = null;
+        if (parentName) {
+          // Try to find spouse by full name (case-insensitive)
+          spouse = await Person.findOne({ $or: [
+            { $expr: { $eq: [ { $concat: ["$firstName", " ", "$surname"] }, parentName ] } },
+            { $expr: { $eq: [ { $concat: ["$surname", " ", "$firstName"] }, parentName ] } }
+          ] });
+          if (!spouse) {
+            // Try to find by email if parentName is an email
+            spouse = await Person.findOne({ email: parentName });
+          }
+        } else if (userPerson.spouses && userPerson.spouses.length > 0) {
+          spouse = await Person.findById(userPerson.spouses[0]);
+        }
+        if (spouse) {
+          // Add child to spouse
+          spouse.children = addUnique(spouse.children, relativePerson._id);
+          await spouse.save();
+          // Add both parents to child's parents array
+          relativePerson.parents = addUnique(relativePerson.parents, spouse._id);
+          relativePerson.parents = addUnique(relativePerson.parents, userPerson._id);
+          // Ensure user and spouse are spouses of each other
+          userPerson.spouses = addUnique(userPerson.spouses, spouse._id);
+          spouse.spouses = addUnique(spouse.spouses, userPerson._id);
+          await userPerson.save();
+          await spouse.save();
+        } else {
+          // No spouse found, just add user as parent
+          relativePerson.parents = addUnique(relativePerson.parents, userPerson._id);
+          await userPerson.save();
+        }
+        // Update siblings for all children of these parents
+        const allParentIds = spouse ? [userPerson._id, spouse._id] : [userPerson._id];
+        let allChildren = new Set();
+        for (const parentId of allParentIds) {
+          const parent = await Person.findById(parentId);
+          if (parent && parent.children) {
+            parent.children.forEach(cid => allChildren.add(cid.toString()));
+          }
+        }
+        allChildren = Array.from(allChildren);
+        for (const cid of allChildren) {
+          const child = await Person.findById(cid);
+          if (child) {
+            child.siblings = Array.from(new Set([...allChildren.filter(id => id !== cid), ...(child.siblings || []).map(x => x.toString())])).map(id => mongoose.Types.ObjectId(id));
+            await child.save();
+          }
+        }
         break;
+      }
       case 'spouse':
         userPerson.spouses = addUnique(userPerson.spouses, relativePerson._id);
         break;
@@ -535,8 +689,8 @@ app.post('/api/add-relative', authenticate, async (req, res) => {
 
     sendResponse(res, 201, 'Relative added and synced successfully!', { relative: { name, surname, maidenName, email, relationship, gender, dob, parentName } });
   } catch (error) {
-    console.error('Error adding relative:', error);
-    sendResponse(res, 500, 'Internal server error', { error: error.message });
+    console.error('Error adding relative:', error.message);
+    sendResponse(res, 500, 'Internal server error');
   }
 });
 
@@ -898,6 +1052,385 @@ app.get('/api/chat/online-users', authenticate, async (req, res) => {
   res.json(users.map(u => ({ ...u, online: online.includes(u._id.toString()) })));
 });
 
+// --- Chess Game Backend Integration ---
+const { Chess } = require('chess.js');
+const games = {};
+
+// REST endpoint to create a new chess game room
+app.post('/create-room', (req, res) => {
+  const roomId = Math.random().toString(36).substr(2, 9);
+  games[roomId] = {
+    chess: new Chess(),
+    players: [],
+    turn: 'w',
+    status: 'waiting',
+  };
+  res.json({ roomId });
+});
+
+// Attach socket.io chess logic
+if (typeof io !== 'undefined') {
+  io.on('connection', (socket) => {
+    socket.on('joinRoom', ({ roomId }) => {
+      const game = games[roomId];
+      if (!game) {
+        socket.emit('error', 'Room does not exist');
+        return;
+      }
+      if (game.players.length >= 2) {
+        socket.emit('error', 'Room is full');
+        return;
+      }
+      game.players.push(socket.id);
+      socket.join(roomId);
+      socket.emit('joined', { color: game.players.length === 1 ? 'w' : 'b' });
+      if (game.players.length === 2) {
+        game.status = 'playing';
+        io.to(roomId).emit('startGame', { fen: game.chess.fen() });
+      }
+    });
+
+    socket.on('move', ({ roomId, from, to, promotion }) => {
+      const game = games[roomId];
+      if (!game || game.status !== 'playing') return;
+      const move = { from, to };
+      if (promotion) move.promotion = promotion;
+      const result = game.chess.move(move);
+      if (result) {
+        io.to(roomId).emit('move', { from, to, promotion, fen: game.chess.fen(), turn: game.chess.turn() });
+        if (game.chess.isGameOver()) {
+          io.to(roomId).emit('gameOver', { result: getGameResult(game.chess) });
+          game.status = 'finished';
+        }
+      }
+    });
+
+    socket.on('disconnecting', () => {
+      for (const roomId of socket.rooms) {
+        if (games[roomId]) {
+          games[roomId].players = games[roomId].players.filter(id => id !== socket.id);
+          if (games[roomId].players.length === 0) {
+            delete games[roomId];
+          } else {
+            io.to(roomId).emit('opponentLeft');
+          }
+        }
+      }
+    });
+  });
+}
+
+function getGameResult(chess) {
+  if (chess.in_checkmate()) {
+    return chess.turn() === 'w' ? 'Black wins by checkmate' : 'White wins by checkmate';
+  } else if (chess.in_stalemate()) {
+    return 'Draw by stalemate';
+  } else if (chess.in_draw()) {
+    return 'Draw';
+  } else if (chess.in_threefold_repetition()) {
+    return 'Draw by repetition';
+  } else if (chess.insufficient_material()) {
+    return 'Draw by insufficient material';
+  }
+  return 'Game over';
+}
+
+// --- Scrabble Socket.io Logic ---
+const BOARD_SIZE = 15;
+const RACK_SIZE = 7;
+const MAX_PLAYERS = 4;
+const MIN_PLAYERS = 2;
+
+const LETTER_VALUES = {
+  A: 1, B: 3, C: 3, D: 2, E: 1, F: 4, G: 2, H: 4, I: 1, J: 8, K: 5, L: 1, M: 3, N: 1, O: 1, P: 3, Q: 10, R: 1, S: 1, T: 1, U: 1, V: 4, W: 4, X: 8, Y: 4, Z: 10, BLANK: 0
+};
+
+// Helper: get all words formed by the placements
+function getWords(board, placements) {
+  // Find the main word (direction: horizontal or vertical)
+  if (!placements.length) return [];
+  // Assume all placements are in a line
+  const isHorizontal = placements.every(p => p.row === placements[0].row);
+  const isVertical = placements.every(p => p.col === placements[0].col);
+  if (!isHorizontal && !isVertical) return [];
+  const words = [];
+  // Main word
+  let mainTiles = [];
+  if (isHorizontal) {
+    const row = placements[0].row;
+    let minCol = Math.min(...placements.map(p => p.col));
+    let maxCol = Math.max(...placements.map(p => p.col));
+    // Extend left
+    while (minCol > 0 && board[row][minCol - 1]) minCol--;
+    // Extend right
+    while (maxCol < BOARD_SIZE - 1 && board[row][maxCol + 1]) maxCol++;
+    for (let c = minCol; c <= maxCol; c++) {
+      mainTiles.push({ row, col: c, letter: board[row][c] });
+    }
+    words.push({
+      word: mainTiles.map(t => t.letter).join(''),
+      tiles: mainTiles,
+      direction: 'horizontal',
+    });
+    // Check for perpendicular words at each placed tile
+    for (const p of placements) {
+      let tiles = [{ row: p.row, col: p.col, letter: board[p.row][p.col] }];
+      // Extend up
+      let r = p.row - 1;
+      while (r >= 0 && board[r][p.col]) { tiles.unshift({ row: r, col: p.col, letter: board[r][p.col] }); r--; }
+      // Extend down
+      r = p.row + 1;
+      while (r < BOARD_SIZE && board[r][p.col]) { tiles.push({ row: r, col: p.col, letter: board[r][p.col] }); r++; }
+      if (tiles.length > 1) {
+        words.push({ word: tiles.map(t => t.letter).join(''), tiles, direction: 'vertical' });
+      }
+    }
+  } else if (isVertical) {
+    const col = placements[0].col;
+    let minRow = Math.min(...placements.map(p => p.row));
+    let maxRow = Math.max(...placements.map(p => p.row));
+    // Extend up
+    while (minRow > 0 && board[minRow - 1][col]) minRow--;
+    // Extend down
+    while (maxRow < BOARD_SIZE - 1 && board[maxRow + 1][col]) maxRow++;
+    for (let r = minRow; r <= maxRow; r++) {
+      mainTiles.push({ row: r, col: col, letter: board[r][col] });
+    }
+    words.push({
+      word: mainTiles.map(t => t.letter).join(''),
+      tiles: mainTiles,
+      direction: 'vertical',
+    });
+    // Check for perpendicular words at each placed tile
+    for (const p of placements) {
+      let tiles = [{ row: p.row, col: p.col, letter: board[p.row][p.col] }];
+      // Extend left
+      let c = p.col - 1;
+      while (c >= 0 && board[p.row][c]) { tiles.unshift({ row: p.row, col: c, letter: board[p.row][c] }); c--; }
+      // Extend right
+      c = p.col + 1;
+      while (c < BOARD_SIZE && board[p.row][c]) { tiles.push({ row: p.row, col: c, letter: board[p.row][c] }); c++; }
+      if (tiles.length > 1) {
+        words.push({ word: tiles.map(t => t.letter).join(''), tiles, direction: 'horizontal' });
+      }
+    }
+  }
+  // Remove duplicates (main word may be found as a perpendicular word)
+  const unique = [];
+  for (const w of words) {
+    if (!unique.some(u => u.word === w.word && u.tiles.length === w.tiles.length && u.tiles.every((t, i) => t.row === w.tiles[i].row && t.col === w.tiles[i].col))) {
+      unique.push(w);
+    }
+  }
+  return unique;
+}
+
+// Helper: score a word (no multipliers for now)
+function scoreWord(wordObj, placements) {
+  // Optionally, you can add board multipliers here
+  let score = 0;
+  for (const t of wordObj.tiles) {
+    score += LETTER_VALUES[t.letter] || 0;
+  }
+  return score;
+}
+
+io.on('connection', (socket) => {
+  // Join Scrabble room
+  socket.on('joinScrabbleRoom', ({ roomId, playerId }) => {
+    socket.join(roomId);
+    const game = scrabbleGames[roomId];
+    if (game) {
+      io.to(roomId).emit('lobbyUpdate', { players: game.players });
+    }
+  });
+
+  // Start game
+  socket.on('startScrabbleGame', ({ roomId }) => {
+    const game = scrabbleGames[roomId];
+    if (!game || game.started || game.players.length < MIN_PLAYERS) return;
+    // Shuffle tile bag and distribute racks
+    game.tileBag = createTileBag().sort(() => Math.random() - 0.5);
+    game.players.forEach(p => {
+      p.rack = [];
+      p.score = 0;
+      for (let i = 0; i < RACK_SIZE; i++) {
+        p.rack.push(game.tileBag.pop());
+      }
+    });
+    game.started = true;
+    game.turn = 0;
+    game.chat = [];
+    game.passes = 0; // Track consecutive passes
+    io.to(roomId).emit('gameStarted', {
+      board: game.board,
+      players: game.players.map(p => ({ id: p.id, name: p.name, score: p.score })),
+      racks: game.players.map(p => p.rack),
+      turn: game.turn,
+    });
+  });
+
+  // Play move
+  socket.on('playScrabbleMove', ({ roomId, playerId, placements }) => {
+    const game = scrabbleGames[roomId];
+    if (!game || !game.started) return;
+    const playerIdx = game.players.findIndex(p => p.id === playerId);
+    if (playerIdx !== game.turn) return; // Not this player's turn
+    // placements: [{row, col, letter}]
+    // Basic validation: all placements are on empty squares and from player's rack
+    let valid = true;
+    const rackCopy = [...game.players[playerIdx].rack];
+    for (const { row, col, letter } of placements) {
+      if (game.board[row][col]) valid = false;
+      const rackIdx = rackCopy.indexOf(letter);
+      if (rackIdx === -1) valid = false;
+      else rackCopy.splice(rackIdx, 1);
+    }
+    if (!valid) return;
+    // Place tiles
+    for (const { row, col, letter } of placements) {
+      game.board[row][col] = letter;
+      const rackIdx = game.players[playerIdx].rack.indexOf(letter);
+      if (rackIdx !== -1) game.players[playerIdx].rack.splice(rackIdx, 1);
+    }
+    // Word validation and scoring
+    const words = getWords(game.board, placements);
+    if (!words.length || !words.every(w => WORD_SET.has(w.word))) {
+      // Undo placements
+      for (const { row, col } of placements) game.board[row][col] = null;
+      // Restore rack
+      for (const { letter } of placements) game.players[playerIdx].rack.push(letter);
+      socket.emit('status', 'Invalid word!');
+      return;
+    }
+    let points = 0;
+    let wordEvents = [];
+    for (const w of words) {
+      const wordScore = scoreWord(w, placements);
+      points += wordScore;
+      wordEvents.push({
+        word: w.word,
+        tiles: w.tiles,
+        score: wordScore,
+        player: game.players[playerIdx].name,
+      });
+    }
+    // Bingo bonus
+    if (placements.length === 7) points += 50;
+    game.players[playerIdx].score = (game.players[playerIdx].score || 0) + points;
+    // Draw new tiles
+    while (game.players[playerIdx].rack.length < RACK_SIZE && game.tileBag.length > 0) {
+      game.players[playerIdx].rack.push(game.tileBag.pop());
+    }
+    // Emit wordPlayed for each word
+    for (const evt of wordEvents) {
+      io.to(roomId).emit('wordPlayed', evt);
+    }
+    // Advance turn
+    game.turn = (game.turn + 1) % game.players.length;
+    // End game if tile bag empty and any player rack is empty
+    if (game.tileBag.length === 0 && game.players.some(p => p.rack.length === 0)) {
+      endScrabbleGame(roomId);
+      return;
+    }
+    // Reset passes on successful move
+    game.passes = 0;
+    io.to(roomId).emit('gameState', {
+      board: game.board,
+      players: game.players.map(p => ({ id: p.id, name: p.name, score: p.score })),
+      racks: game.players.map(p => p.rack),
+      turn: game.turn,
+    });
+  });
+
+  // Pass turn
+  socket.on('passScrabbleTurn', ({ roomId, playerId }) => {
+    const game = scrabbleGames[roomId];
+    if (!game || !game.started) return;
+    const playerIdx = game.players.findIndex(p => p.id === playerId);
+    if (playerIdx !== game.turn) return;
+    game.passes = (game.passes || 0) + 1;
+    // Advance turn
+    game.turn = (game.turn + 1) % game.players.length;
+    // End game if 6 consecutive passes
+    if (game.passes >= 6) {
+      endScrabbleGame(roomId);
+      return;
+    }
+    io.to(roomId).emit('gameState', {
+      board: game.board,
+      players: game.players.map(p => ({ id: p.id, name: p.name, score: p.score })),
+      racks: game.players.map(p => p.rack),
+      turn: game.turn,
+    });
+  });
+
+  // Exchange tiles
+  socket.on('exchangeScrabbleTiles', ({ roomId, playerId, tiles }) => {
+    const game = scrabbleGames[roomId];
+    if (!game || !game.started) return;
+    const playerIdx = game.players.findIndex(p => p.id === playerId);
+    if (playerIdx !== game.turn) return;
+    if (game.tileBag.length < tiles.length) return; // Not enough tiles to exchange
+    // Remove tiles from rack
+    for (const letter of tiles) {
+      const idx = game.players[playerIdx].rack.indexOf(letter);
+      if (idx !== -1) game.players[playerIdx].rack.splice(idx, 1);
+    }
+    // Put exchanged tiles back in bag and shuffle
+    game.tileBag.push(...tiles);
+    game.tileBag = _.shuffle(game.tileBag);
+    // Draw new tiles
+    while (game.players[playerIdx].rack.length < RACK_SIZE && game.tileBag.length > 0) {
+      game.players[playerIdx].rack.push(game.tileBag.pop());
+    }
+    game.passes = (game.passes || 0) + 1;
+    // Advance turn
+    game.turn = (game.turn + 1) % game.players.length;
+    // End game if 6 consecutive passes
+    if (game.passes >= 6) {
+      endScrabbleGame(roomId);
+      return;
+    }
+    io.to(roomId).emit('gameState', {
+      board: game.board,
+      players: game.players.map(p => ({ id: p.id, name: p.name, score: p.score })),
+      racks: game.players.map(p => p.rack),
+      turn: game.turn,
+    });
+  });
+
+  // End-game detection after a move
+  function endScrabbleGame(roomId) {
+    const game = scrabbleGames[roomId];
+    if (!game) return;
+    // Final scoring: subtract remaining rack tiles from each player
+    game.players.forEach(p => {
+      const penalty = (p.rack || []).reduce((sum, l) => sum + (LETTER_VALUES[l] || 0), 0);
+      p.score -= penalty;
+    });
+    // Find winner(s)
+    const maxScore = Math.max(...game.players.map(p => p.score));
+    const winners = game.players.filter(p => p.score === maxScore).map(p => p.name);
+    io.to(roomId).emit('gameOver', {
+      players: game.players.map(p => ({ id: p.id, name: p.name, score: p.score })),
+      winners,
+    });
+    game.started = false;
+  }
+
+  // Chat
+  socket.on('scrabbleChat', ({ roomId, playerId, message }) => {
+    const game = scrabbleGames[roomId];
+    if (!game) return;
+    const player = game.players.find(p => p.id === playerId);
+    const chatMsg = { name: player ? player.name : 'Player', message };
+    game.chat = game.chat || [];
+    game.chat.push(chatMsg);
+    io.to(roomId).emit('scrabbleChat', chatMsg);
+  });
+});
+
 // Ensure models directory exists
 const modelsDir = path.join(__dirname, 'models');
 if (!fs.existsSync(modelsDir)) fs.mkdirSync(modelsDir);
@@ -968,6 +1501,7 @@ app.use('/api/person', personRouter);
 
 // Add group routes
 app.use('/api/groups', groupRoutes);
+app.use('/api/scrabble', scrabbleRoutes);
 
 // Fetch invitation details by token
 app.get('/api/invitation/:token', async (req, res) => {
